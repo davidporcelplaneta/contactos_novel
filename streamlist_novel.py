@@ -1,80 +1,160 @@
-import streamlit as st
-import pandas as pd
-from datetime import datetime
+# app.py
 import io
+import numpy as np
+import pandas as pd
+import streamlit as st
+from datetime import datetime
 
-st.set_page_config(page_title="NOVEL - Premium Numbers", layout="wide")
-st.title("📥 NOVEL - Carga y limpieza de contactos")
+st.set_page_config(page_title="Deduplicador Contactos", page_icon="🧹", layout="wide")
 
-# --- SUBIDA DE ARCHIVOS ---
-st.header("1. Subida de archivos")
-novel_file = st.file_uploader("Sube el archivo novel_pn.csv", type="csv")
-listanegra_file = st.file_uploader("Sube el archivo listanegra.xlsx", type="xlsx")
-ventas_file = st.file_uploader("Sube el archivo bbdd_ventas.xlsx", type="xlsx")
+EXPECTED_COLUMNS = ['ENLACE LINKEDIN', 'Nombre', 'Numero', 'NUMERO DATO', 'TITULACION']
 
-if novel_file and listanegra_file and ventas_file:
-    # Detectar separador
-    sample = novel_file.read(1000).decode("utf-8", errors="replace")
-    sep = ";" if ";" in sample else ("\t" if "\t" in sample else ",")
-    novel_file.seek(0)
-    df = pd.read_csv(novel_file, sep=sep, engine="python", on_bad_lines="skip")
-    df_lista_negra = pd.read_excel(listanegra_file)
-    df_ventas = pd.read_excel(ventas_file)
 
-    # Normalizar campos
-    df['profile_url_lower'] = df['ENLACE LINKEDIN'].astype(str).str.strip().str.lower()
-    df['current_company_lower'] = df['EMPRESA'].astype(str).str.strip().str.lower()
-    df['current_company_position_lower'] = df['PUESTO'].astype(str).str.strip().str.lower()
+# --------------------------
+# Normalización
+# --------------------------
+def normalize_phone(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.replace(r"\D+", "", regex=True)
+    return s.replace({"": np.nan})
 
-    df_lista_negra['enlace'] = df_lista_negra['enlace'].astype(str).str.strip().str.lower()
-    df_lista_negra['empresa'] = df_lista_negra['empresa'].astype(str).str.strip().str.lower()
-    df_lista_negra['puesto'] = df_lista_negra['puesto'].astype(str).str.strip().str.lower()
+def normalize_text(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.strip().str.lower()
+    s = s.str.replace(r"\s+", " ", regex=True)
+    return s.replace({"nan": np.nan, "none": np.nan, "nat": np.nan})
 
-    # Deduplicación con lista negra
-    con_nombre = df[df['Nombre'].isin(df_lista_negra['nombre'])]
-    sin_nombre = df[~df['Nombre'].isin(df_lista_negra['nombre'])]
-    con_nombre = con_nombre[~con_nombre['profile_url_lower'].isin(df_lista_negra['enlace'])]
-    con_nombre = con_nombre[~con_nombre['current_company_lower'].isin(df_lista_negra['empresa'])]
-    con_nombre = con_nombre[~con_nombre['current_company_position_lower'].isin(df_lista_negra['puesto'])]
-    df_neto_v1 = pd.concat([con_nombre, sin_nombre], ignore_index=True)
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=EXPECTED_COLUMNS)
+    out = df.copy()
+    out.columns = [c.strip().lower() for c in out.columns]
+    missing = set(EXPECTED_COLUMNS) - set(out.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas obligatorias: {sorted(missing)}")
+    out = out[EXPECTED_COLUMNS]
+    for col in ['ENLACE LINKEDIN', 'Nombre', 'Numero', 'NUMERO DATO', 'TITULACION']:
+        out[col] = normalize_text(out[col])
+    out['telefono'] = normalize_phone(out['telefono'])
+    return out
 
-    # Eliminar columnas auxiliares
-    df_neto_v2 = df_neto_v1.drop(columns=['profile_url_lower', 'current_company_lower', 'current_company_position_lower'], errors='ignore')
+# --------------------------
+# Anti-join exacto (lista negra)
+# --------------------------
+def anti_join_all_columns(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+    if right is None or right.empty:
+        return left.copy()
+    merged = left.merge(right, on=EXPECTED_COLUMNS, how="left", indicator=True)
+    return merged[merged["_merge"] == "left_only"].drop(columns="_merge")
 
-    # Eliminar si ya está en ventas
-    df_neto_v2 = df_neto_v2[~df_neto_v2['NUMERO DATO'].isin(df_ventas['Nº-AZ'])]
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Sheet1")
+    buf.seek(0)
+    return buf.read()
 
-    # Campos requeridos
-    df_neto_v2['Grupo'] = 'Inercia'
-    df_neto_v2 = df_neto_v2.rename(columns={'General': 'General (SI/NO/MOD)'})
-    df_neto_v2['General (SI/NO/MOD)'] = 'MOD'
-    df_neto_v2['GESTION LISTADO PROPIO'] = 'CITAS'
-    df_neto_v2['ORIGEN DATO'] = 'NOVEL'
-    df_neto_v2['Base de Datos'] = 'NOVEL_' + datetime.today().strftime('%Y-%m-%d')
-    df_neto_v2['Agente'] = 'IP: 136 Listado Novel'
-    df_neto_v2['CITA'] = 'SI'
-    df_neto_v2['BUSQUEDA FECHA'] = datetime.today().strftime('%Y-%m-%d')
-    df_neto_v2['FECHA DE CITA'] = datetime.today().strftime('%Y-%m-%d')
+# --------------------------
+# UI
+# --------------------------
+st.title("🧹 Depurador de Contactos (solo Lista Negra)")
+st.write("Elimina coincidencias **exactas en todas las columnas** contra la *Lista negra*.")
 
-    for col in ['Números2', 'Números3']:
-        if col in df_neto_v2.columns:
-            df_neto_v2[col] = df_neto_v2[col].apply(lambda x: str(int(x)) if isinstance(x, float) and x.is_integer() else (str(x) if pd.notnull(x) else ''))
+c1, c2 = st.columns(2)
+with c1:
+    up_reparto = st.file_uploader("📥 Reparto (.xlsx)", type=["xlsx"])
+with c2:
+    up_black = st.file_uploader("🗑️ Lista negra (.xlsx)", type=["xlsx"])
 
-    columnas_a_borrar = [
-        "Agente", "Grupo", "Observaciones", "Fax", "Correo",
-        "GESTION LISTADO PROPIO", "TELEOPERADOR", "NUMERO DATO", "FECHA DE CONTACTO",
-        "FECHA DE CONTACTO (NO USAR)", "CUALIFICA", "RESULTADO", "",
-        "FECHA DE CITA (NO USAR)", "ASESOR", "RESULTADO ASESOR", "OBSERVACIONES ASESOR"
-    ]
-    for col in columnas_a_borrar:
-        if col != "" and col in df_neto_v2.columns:
-            df_neto_v2[col] = ""
+preview = st.checkbox("👁️ Previsualizar (primeras 10 filas)", value=True)
 
-    # Exportación final
-    st.header("2. Descarga del resultado")
-    csv = df_neto_v2.to_csv(index=False, sep=';', encoding='utf-8-sig')
-    st.download_button("📤 Descargar archivo final NOVEL", csv, file_name="NOVEL Cargar Contactos PN.csv", mime="text/csv")
+def read_first_sheet(uploaded):
+    if not uploaded:
+        return None
+    try:
+        return pd.read_excel(uploaded)  # primera hoja
+    except Exception as e:
+        st.error(f"Error leyendo el Excel: {e}")
+        return None
 
-    st.success(f"✅ Contactos procesados: {len(df_neto_v2)}")
-else:
-    st.warning("⚠️ Sube los tres archivos para continuar.")
+# Previsualización
+pa, pb = st.columns(2)
+with pa:
+    if up_reparto:
+        raw = read_first_sheet(up_reparto)
+        if raw is not None:
+            st.caption(f"**Reparto** ({len(raw)} filas)")
+            if preview: st.dataframe(raw.head(10))
+with pb:
+    if up_black:
+        raw = read_first_sheet(up_black)
+        if raw is not None:
+            st.caption(f"**Lista negra** ({len(raw)} filas)")
+            if preview: st.dataframe(raw.head(10))
+
+st.markdown("---")
+
+# Ejecutar
+if st.button("🚀 Ejecutar limpieza (Lista Negra)"):
+    if not up_reparto or not up_black:
+        st.error("Sube los dos archivos: Reparto y Lista negra.")
+        st.stop()
+    try:
+        # 1) Leer primera hoja
+        df_rep_raw = read_first_sheet(up_reparto)
+        df_blk_raw = read_first_sheet(up_black)
+
+        # 2) Normalizar
+        df_rep = normalize_df(df_rep_raw)
+        df_blk = normalize_df(df_blk_raw)
+
+        # 3) Anti-join exacto (lista negra)
+        before = len(df_rep)
+        df_final = anti_join_all_columns(df_rep, df_blk)
+        removed_ln = before - len(df_final)
+
+        # 4) Formato salida PN
+        fecha_str = datetime.today().strftime('%d%m%Y')
+        base_nombre = 'Novel_' + datetime.today().strftime('%Y-%m-%d')
+        df_final["tipo_registro"] = "Novel"
+        df_final["marca"]= "EAE"
+        df_final["subcanal"] ="Empresas"
+        df_final_PN = pd.DataFrame({
+            'ID Integrador': df_final['NUMERO DATO'],	
+            'Fecha Captación': '',
+            'Nombre de pila': df_final['nombre'],
+            'Primer Apellido':'',
+            'Correo electrónico':'',	
+            'Teléfono móvil': df_final['Numero'],
+            'Origen Del Dato':'',
+            'Guia/Webinar/Curso Descargado':'',
+            'Ciudad':'',
+            'Tipo De Registro':df_final['tipo_registro'],
+            'Subtipo De Registro':'',
+            'Marca': df_final['marca'],
+            'Sub canal': df_final['subcanal'],
+            'Código Postal':'',
+            'Link Linkedin': df_final['ENLACE LINKEDIN'],
+            'Nivel De Estudios': df_final['TITULACION'],
+            'Base De Datos': base_nombre,
+            'Zona comercial':''
+        })        
+
+        # 5) Métricas y resultados
+        st.metric("Filas iniciales", before)
+        st.metric("Eliminadas por Lista Negra", removed_ln)
+        st.metric("Filas finales", len(df_final_PN))
+
+        st.subheader("✅ Resultado final (formato PN)")
+        st.dataframe(df_final_PN.head(50))
+
+        # 6) Descarga (formato PN mostrado)
+        st.download_button(
+            "⬇️ Descargar resultado final (PN)",
+            data=to_excel_bytes(df_final_PN),
+            file_name="contactos_reparto_final_PN.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    except ValueError as ve:
+        st.error(f"Validación de columnas: {ve}")
+    except Exception as e:
+        st.exception(e)
